@@ -3,6 +3,7 @@
 #include <iostream>
 #include <random>
 #include <stdexcept>
+#include <openssl/sha.h>
 
 using namespace std;
 
@@ -60,14 +61,10 @@ void FileEncryptor::encrypt_file(QuantumWrapper& quantum, const string& input_pa
     cout << "  Performing key encapsulation..." << endl;
     auto [ciphertext, shared_secret] = quantum.encapsulate(public_key);
     
-    // Step 4: Derive AES-256 key from shared secret (use first 32 bytes)
+    // Step 3: Derive AES-256 key from shared secret using SHA-256 KDF
+    cout << "  Deriving AES key with SHA-256..." << endl;
     vector<uint8_t> aes_key(32);
-    if (shared_secret.size() >= 32) {
-        copy(shared_secret.begin(), shared_secret.begin() + 32, aes_key.begin());
-    } else {
-        // If shared secret is smaller, pad with zeros
-        copy(shared_secret.begin(), shared_secret.end(), aes_key.begin());
-    }
+    SHA256(shared_secret.data(), shared_secret.size(), aes_key.data());
     
     // Step 5: Generate random IV for AES
     vector<uint8_t> iv = generate_iv();
@@ -155,13 +152,10 @@ void FileEncryptor::decrypt_file(QuantumWrapper& quantum, const string& input_pa
     cout << "  Recovering shared secret..." << endl;
     vector<uint8_t> shared_secret = quantum.decapsulate(ciphertext, secret_key);
     
-    // Step 8: Derive AES-256 key from shared secret
+    // Step 8: Derive AES-256 key from shared secret using SHA-256 KDF
+    cout << "  Deriving AES key with SHA-256..." << endl;
     vector<uint8_t> aes_key(32);
-    if (shared_secret.size() >= 32) {
-        copy(shared_secret.begin(), shared_secret.begin() + 32, aes_key.begin());
-    } else {
-        copy(shared_secret.begin(), shared_secret.end(), aes_key.begin());
-    }
+    SHA256(shared_secret.data(), shared_secret.size(), aes_key.data());
     
     // Step 9: Decrypt the data with AES-256-CBC
     cout << "  Decrypting with AES-256-CBC..." << endl;

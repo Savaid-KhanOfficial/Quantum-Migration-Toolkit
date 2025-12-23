@@ -80,6 +80,7 @@ cmake --build build
 ### Prerequisites
 - **C++17 compiler** (GCC 7+, Clang 5+, MSVC 2017+)
 - **CMake 3.10+**
+- **OpenSSL 1.1.1 or 3.0+** (Production-grade encryption)
 - **liboqs** (Open Quantum Safe library)
 
 ### Installation
@@ -150,12 +151,15 @@ SUMMARY: 3 vulnerabilities detected
 | Component | Algorithm | Status | Key Size |
 |-----------|-----------|--------|----------|
 | Key Exchange | **Kyber-512** | NIST Selected (PQC) | 1632 bytes (public) |
-| Symmetric Cipher | **AES-256-CBC** | NIST Approved | 256 bits |
+| Symmetric Cipher | **AES-256-CBC** | NIST Approved (OpenSSL) | 256 bits |
+| Key Derivation | **SHA-256 KDF** | Industry Standard | 256 bits |
 | Hashing | SHA-256 | Quantum-resistant | 256 bits |
 
 ### Security Guarantees
 - **Kyber-512**: IND-CCA2 secure against quantum adversaries
 - **AES-256**: 256-bit security level (quantum-resistant with Grover's algorithm)
+- **Proper KDF**: Shared secrets are hashed via SHA-256 before use as AES keys
+- **OpenSSL EVP**: Production-tested cryptographic implementation with automatic PKCS7 padding
 - **Hybrid Design**: Defense-in-depth approach combining post-quantum and classical algorithms
 
 ---
@@ -193,7 +197,7 @@ This project is open-source and available under the MIT License.
 | Post-Quantum Ready | ✅ Yes | ❌ No |
 | NIST-Approved Algorithms | ✅ Kyber-512 | ❌ RSA/ECC |
 | Automated Vulnerability Scanning | ✅ Yes | ⚠️ Manual Review |
-| Production-Ready | ✅ C++17, No Dependencies | ⚠️ Experimental |
+| Production-Ready | ✅ C++17, Standard Dependencies (OpenSSL + liboqs) | ⚠️ Experimental |
 | Easy Integration | ✅ CLI + CMake | ⚠️ Complex Setup |
 
 ---
