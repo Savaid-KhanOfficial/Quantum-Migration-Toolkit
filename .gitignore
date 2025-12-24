@@ -1,0 +1,44 @@
+# Build directories
+build/
+*/build/
+**/build/
+
+# Compiled binaries
+*.exe
+*.lib
+*.obj
+*.dll
+*.so
+*.dylib
+*.a
+
+# CMake cache
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+*.cmake
+!CMakeLists.txt
+
+# Visual Studio
+.vs/
+.vscode/
+*.user
+*.vcxproj
+*.vcxproj.filters
+*.sln
+
+# Output files
+audit_report.txt
+*.log
+
+# Keys (for security - don't commit private keys!)
+*.priv
+*.pub
+*.qenc
+
+# IDE and OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
