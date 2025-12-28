@@ -1,55 +1,180 @@
 #include "FileEncryptor.hpp"
 #include <fstream>
 #include <iostream>
-#include <random>
 #include <stdexcept>
+#include <cstring>
 #include <openssl/sha.h>
+#include <openssl/evp.h>
+#include <openssl/rand.h>
 
 using namespace std;
 
-vector<uint8_t> FileEncryptor::read_file(const string& path) {
-    ifstream file(path, ios::binary);
-    if (!file) {
-        throw runtime_error("Failed to open file for reading: " + path);
-    }
-    
-    // Read entire file into vector
-    file.seekg(0, ios::end);
-    size_t size = file.tellg();
-    file.seekg(0, ios::beg);
-    
-    vector<uint8_t> data(size);
-    file.read(reinterpret_cast<char*>(data.data()), size);
-    file.close();
-    
-    return data;
-}
-
-void FileEncryptor::write_file(const string& path, const vector<uint8_t>& data) {
-    ofstream file(path, ios::binary);
-    if (!file) {
-        throw runtime_error("Failed to open file for writing: " + path);
-    }
-    
-    file.write(reinterpret_cast<const char*>(data.data()), data.size());
-    file.close();
-}
-
+// Generate cryptographically secure random IV using OpenSSL
 vector<uint8_t> FileEncryptor::generate_iv() {
     vector<uint8_t> iv(16);
-    random_device rd;
-    mt19937 gen(rd());
-    uniform_int_distribution<> dis(0, 255);
-    
-    for (size_t i = 0; i < iv.size(); i++) {
-        iv[i] = static_cast<uint8_t>(dis(gen));
+    if (RAND_bytes(iv.data(), 16) != 1) {
+        throw runtime_error("Failed to generate random IV");
     }
-    
     return iv;
 }
 
-void FileEncryptor::encrypt_file(QuantumWrapper& quantum, const string& input_path, const string& output_path) {
-    cout << "\n[FILE ENCRYPTOR] Starting quantum-safe encryption..." << endl;
+// Stream encrypt file content in 64MB chunks
+void FileEncryptor::stream_encrypt(ifstream& input, ofstream& output,
+                                    const vector<uint8_t>& key,
+                                    const vector<uint8_t>& iv,
+                                    size_t input_size) {
+    // Create and initialize the cipher context
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) {
+        throw runtime_error("Failed to create EVP_CIPHER_CTX");
+    }
+    
+    // Initialize encryption with AES-256-CBC
+    if (EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), nullptr, key.data(), iv.data()) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        throw runtime_error("EVP_EncryptInit_ex failed");
+    }
+    
+    // Allocate buffers for streaming
+    vector<uint8_t> input_buffer(CHUNK_SIZE);
+    vector<uint8_t> output_buffer(CHUNK_SIZE + EVP_CIPHER_block_size(EVP_aes_256_cbc()));
+    
+    size_t bytes_processed = 0;
+    int out_len = 0;
+    
+    cout << "  Streaming encryption (chunk size: " << (CHUNK_SIZE / (1024 * 1024)) << " MB)..." << endl;
+    
+    // Process file in chunks
+    while (bytes_processed < input_size) {
+        size_t bytes_to_read = min(CHUNK_SIZE, input_size - bytes_processed);
+        input.read(reinterpret_cast<char*>(input_buffer.data()), bytes_to_read);
+        
+        if (!input && !input.eof()) {
+            EVP_CIPHER_CTX_free(ctx);
+            throw runtime_error("Error reading input file");
+        }
+        
+        size_t bytes_read = input.gcount();
+        
+        // Encrypt this chunk
+        if (EVP_EncryptUpdate(ctx, output_buffer.data(), &out_len, 
+                              input_buffer.data(), static_cast<int>(bytes_read)) != 1) {
+            EVP_CIPHER_CTX_free(ctx);
+            throw runtime_error("EVP_EncryptUpdate failed");
+        }
+        
+        // Write encrypted chunk to output
+        output.write(reinterpret_cast<char*>(output_buffer.data()), out_len);
+        
+        bytes_processed += bytes_read;
+        
+        // Progress indicator for large files
+        if (input_size > CHUNK_SIZE) {
+            int progress = static_cast<int>((bytes_processed * 100) / input_size);
+            cout << "\r  Encrypting: " << progress << "% (" 
+                 << (bytes_processed / (1024 * 1024)) << " / " 
+                 << (input_size / (1024 * 1024)) << " MB)" << flush;
+        }
+    }
+    
+    // Finalize encryption (handle padding)
+    if (EVP_EncryptFinal_ex(ctx, output_buffer.data(), &out_len) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        throw runtime_error("EVP_EncryptFinal_ex failed");
+    }
+    
+    if (out_len > 0) {
+        output.write(reinterpret_cast<char*>(output_buffer.data()), out_len);
+    }
+    
+    if (input_size > CHUNK_SIZE) {
+        cout << "\r  Encrypting: 100% completed                    " << endl;
+    }
+    
+    EVP_CIPHER_CTX_free(ctx);
+}
+
+// Stream decrypt file content in 64MB chunks
+void FileEncryptor::stream_decrypt(ifstream& input, ofstream& output,
+                                    const vector<uint8_t>& key,
+                                    const vector<uint8_t>& iv,
+                                    size_t encrypted_size) {
+    // Create and initialize the cipher context
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) {
+        throw runtime_error("Failed to create EVP_CIPHER_CTX");
+    }
+    
+    // Initialize decryption with AES-256-CBC
+    if (EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), nullptr, key.data(), iv.data()) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        throw runtime_error("EVP_DecryptInit_ex failed");
+    }
+    
+    // Allocate buffers for streaming
+    vector<uint8_t> input_buffer(CHUNK_SIZE);
+    vector<uint8_t> output_buffer(CHUNK_SIZE + EVP_CIPHER_block_size(EVP_aes_256_cbc()));
+    
+    size_t bytes_processed = 0;
+    int out_len = 0;
+    
+    cout << "  Streaming decryption (chunk size: " << (CHUNK_SIZE / (1024 * 1024)) << " MB)..." << endl;
+    
+    // Process file in chunks
+    while (bytes_processed < encrypted_size) {
+        size_t bytes_to_read = min(CHUNK_SIZE, encrypted_size - bytes_processed);
+        input.read(reinterpret_cast<char*>(input_buffer.data()), bytes_to_read);
+        
+        if (!input && !input.eof()) {
+            EVP_CIPHER_CTX_free(ctx);
+            throw runtime_error("Error reading encrypted file");
+        }
+        
+        size_t bytes_read = input.gcount();
+        
+        // Decrypt this chunk
+        if (EVP_DecryptUpdate(ctx, output_buffer.data(), &out_len,
+                              input_buffer.data(), static_cast<int>(bytes_read)) != 1) {
+            EVP_CIPHER_CTX_free(ctx);
+            throw runtime_error("EVP_DecryptUpdate failed");
+        }
+        
+        // Write decrypted chunk to output
+        output.write(reinterpret_cast<char*>(output_buffer.data()), out_len);
+        
+        bytes_processed += bytes_read;
+        
+        // Progress indicator for large files
+        if (encrypted_size > CHUNK_SIZE) {
+            int progress = static_cast<int>((bytes_processed * 100) / encrypted_size);
+            cout << "\r  Decrypting: " << progress << "% (" 
+                 << (bytes_processed / (1024 * 1024)) << " / " 
+                 << (encrypted_size / (1024 * 1024)) << " MB)" << flush;
+        }
+    }
+    
+    // Finalize decryption (handle padding removal)
+    if (EVP_DecryptFinal_ex(ctx, output_buffer.data(), &out_len) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        throw runtime_error("EVP_DecryptFinal_ex failed - possibly incorrect key or corrupted data");
+    }
+    
+    if (out_len > 0) {
+        output.write(reinterpret_cast<char*>(output_buffer.data()), out_len);
+    }
+    
+    if (encrypted_size > CHUNK_SIZE) {
+        cout << "\r  Decrypting: 100% completed                    " << endl;
+    }
+    
+    EVP_CIPHER_CTX_free(ctx);
+}
+
+void FileEncryptor::encrypt_file(QuantumWrapper& quantum, 
+                                  DilithiumWrapper& dilithium,
+                                  const string& input_path, 
+                                  const string& output_path) {
+    cout << "\n[FILE ENCRYPTOR v2] Starting quantum-safe encryption with streaming..." << endl;
     
     // Step 1: Get public key from the quantum wrapper
     vector<uint8_t> public_key = quantum.get_public_key();
@@ -58,7 +183,7 @@ void FileEncryptor::encrypt_file(QuantumWrapper& quantum, const string& input_pa
     }
     
     // Step 2: Encapsulate to get shared secret (this will be used as AES key)
-    cout << "  Performing key encapsulation..." << endl;
+    cout << "  Performing Kyber key encapsulation..." << endl;
     auto [ciphertext, shared_secret] = quantum.encapsulate(public_key);
     
     // Step 3: Derive AES-256 key from shared secret using SHA-256 KDF
@@ -66,105 +191,183 @@ void FileEncryptor::encrypt_file(QuantumWrapper& quantum, const string& input_pa
     vector<uint8_t> aes_key(32);
     SHA256(shared_secret.data(), shared_secret.size(), aes_key.data());
     
-    // Step 5: Generate random IV for AES
+    // Step 4: Generate random IV for AES
     vector<uint8_t> iv = generate_iv();
     
-    // Step 6: Read the input file
-    cout << "  Reading input file: " << input_path << endl;
-    vector<uint8_t> plaintext = read_file(input_path);
-    cout << "  File size: " << plaintext.size() << " bytes" << endl;
+    // Step 5: Open input file and get size
+    ifstream input(input_path, ios::binary);
+    if (!input) {
+        throw runtime_error("Failed to open input file: " + input_path);
+    }
     
-    // Step 7: Encrypt the file content with AES-256-CBC
-    cout << "  Encrypting with AES-256-CBC..." << endl;
-    vector<uint8_t> encrypted_data = AES::encrypt(plaintext, aes_key, iv);
+    input.seekg(0, ios::end);
+    size_t input_size = input.tellg();
+    input.seekg(0, ios::beg);
+    cout << "  Input file: " << input_path << " (" << input_size << " bytes)" << endl;
     
-    // Step 8: Build the output file structure:
-    // [public_key_size(4)] [public_key] [ciphertext_size(4)] [ciphertext] 
-    // [iv(16)] [encrypted_data_size(4)] [encrypted_data]
-    vector<uint8_t> output;
+    // Step 6: Open output file
+    ofstream output(output_path, ios::binary);
+    if (!output) {
+        throw runtime_error("Failed to open output file: " + output_path);
+    }
     
-    // Write public key size and data
-    uint32_t pk_size = static_cast<uint32_t>(public_key.size());
-    output.insert(output.end(), reinterpret_cast<uint8_t*>(&pk_size), reinterpret_cast<uint8_t*>(&pk_size) + 4);
-    output.insert(output.end(), public_key.begin(), public_key.end());
-    
-    // Write ciphertext size and data
+    // Step 7: Write header - Kyber ciphertext (no public key!)
+    // File format: [ct_len(4B)][ciphertext][iv(16B)][encrypted_data][sig_len(4B)][signature]
     uint32_t ct_size = static_cast<uint32_t>(ciphertext.size());
-    output.insert(output.end(), reinterpret_cast<uint8_t*>(&ct_size), reinterpret_cast<uint8_t*>(&ct_size) + 4);
-    output.insert(output.end(), ciphertext.begin(), ciphertext.end());
+    output.write(reinterpret_cast<const char*>(&ct_size), 4);
+    output.write(reinterpret_cast<const char*>(ciphertext.data()), ciphertext.size());
     
     // Write IV (fixed 16 bytes)
-    output.insert(output.end(), iv.begin(), iv.end());
+    output.write(reinterpret_cast<const char*>(iv.data()), iv.size());
     
-    // Write encrypted data size and data
-    uint32_t enc_size = static_cast<uint32_t>(encrypted_data.size());
-    output.insert(output.end(), reinterpret_cast<uint8_t*>(&enc_size), reinterpret_cast<uint8_t*>(&enc_size) + 4);
-    output.insert(output.end(), encrypted_data.begin(), encrypted_data.end());
+    // Record position where encrypted data starts (for signature calculation)
+    streampos encrypted_data_start = output.tellp();
     
-    // Step 9: Write to output file
-    cout << "  Writing encrypted file: " << output_path << endl;
-    write_file(output_path, output);
+    // Step 8: Stream encrypt the file content
+    stream_encrypt(input, output, aes_key, iv, input_size);
     
-    cout << "  Total encrypted file size: " << output.size() << " bytes" << endl;
-    cout << "\n[SUCCESS] File encrypted successfully!" << endl;
+    input.close();
+    
+    // Step 9: Calculate signature over the entire ciphertext portion
+    // (Kyber ciphertext + IV + encrypted data)
+    output.flush();
+    streampos encrypted_data_end = output.tellp();
+    
+    // Read back the data we need to sign
+    cout << "  Generating Dilithium signature..." << endl;
+    
+    ifstream sign_input(output_path, ios::binary);
+    if (!sign_input) {
+        throw runtime_error("Failed to reopen output file for signing");
+    }
+    
+    size_t data_to_sign_size = static_cast<size_t>(encrypted_data_end);
+    vector<uint8_t> data_to_sign(data_to_sign_size);
+    sign_input.read(reinterpret_cast<char*>(data_to_sign.data()), data_to_sign_size);
+    sign_input.close();
+    
+    // Sign the ciphertext
+    vector<uint8_t> signature = dilithium.sign_message(data_to_sign);
+    cout << "  Signature size: " << signature.size() << " bytes" << endl;
+    
+    // Step 10: Append signature to output file
+    uint32_t sig_size = static_cast<uint32_t>(signature.size());
+    output.write(reinterpret_cast<const char*>(&sig_size), 4);
+    output.write(reinterpret_cast<const char*>(signature.data()), signature.size());
+    
+    output.close();
+    
+    // Get final file size
+    ifstream final_check(output_path, ios::binary | ios::ate);
+    size_t final_size = final_check.tellg();
+    final_check.close();
+    
+    cout << "  Output file: " << output_path << " (" << final_size << " bytes)" << endl;
+    cout << "\n[SUCCESS] File encrypted and signed successfully!" << endl;
 }
 
-void FileEncryptor::decrypt_file(QuantumWrapper& quantum, const string& input_path, const string& output_path) {
-    cout << "\n[FILE DECRYPTOR] Starting quantum-safe decryption..." << endl;
+void FileEncryptor::decrypt_file(QuantumWrapper& quantum,
+                                  DilithiumWrapper& dilithium,
+                                  const string& input_path, 
+                                  const string& output_path) {
+    cout << "\n[FILE DECRYPTOR v2] Starting quantum-safe decryption with verification..." << endl;
     
-    // Step 1: Read the encrypted file
-    cout << "  Reading encrypted file: " << input_path << endl;
-    vector<uint8_t> encrypted_file = read_file(input_path);
+    // Step 1: Open encrypted file and get size
+    ifstream input(input_path, ios::binary);
+    if (!input) {
+        throw runtime_error("Failed to open encrypted file: " + input_path);
+    }
     
-    size_t offset = 0;
+    input.seekg(0, ios::end);
+    size_t file_size = input.tellg();
+    input.seekg(0, ios::beg);
+    cout << "  Encrypted file: " << input_path << " (" << file_size << " bytes)" << endl;
     
-    // Step 2: Extract public key
-    uint32_t pk_size;
-    memcpy(&pk_size, &encrypted_file[offset], 4);
-    offset += 4;
-    vector<uint8_t> public_key(encrypted_file.begin() + offset, encrypted_file.begin() + offset + pk_size);
-    offset += pk_size;
-    
-    // Step 3: Extract ciphertext
+    // Step 2: Read Kyber ciphertext
     uint32_t ct_size;
-    memcpy(&ct_size, &encrypted_file[offset], 4);
-    offset += 4;
-    vector<uint8_t> ciphertext(encrypted_file.begin() + offset, encrypted_file.begin() + offset + ct_size);
-    offset += ct_size;
+    input.read(reinterpret_cast<char*>(&ct_size), 4);
     
-    // Step 4: Extract IV
-    vector<uint8_t> iv(encrypted_file.begin() + offset, encrypted_file.begin() + offset + 16);
-    offset += 16;
+    vector<uint8_t> ciphertext(ct_size);
+    input.read(reinterpret_cast<char*>(ciphertext.data()), ct_size);
     
-    // Step 5: Extract encrypted data
-    uint32_t enc_size;
-    memcpy(&enc_size, &encrypted_file[offset], 4);
-    offset += 4;
-    vector<uint8_t> encrypted_data(encrypted_file.begin() + offset, encrypted_file.begin() + offset + enc_size);
+    // Step 3: Read IV
+    vector<uint8_t> iv(16);
+    input.read(reinterpret_cast<char*>(iv.data()), 16);
     
-    // Step 6: Get secret key from quantum wrapper
+    // Step 4: Calculate where encrypted data ends and signature begins
+    // File structure: [ct_len(4B)][ciphertext][iv(16B)][encrypted_data][sig_len(4B)][signature]
+    // We need to read signature length from the end to determine encrypted data size
+    
+    streampos current_pos = input.tellg(); // Position after IV
+    
+    // Seek to end - 4 bytes to read signature length
+    input.seekg(-4, ios::end);
+    uint32_t sig_size;
+    input.read(reinterpret_cast<char*>(&sig_size), 4);
+    
+    // Calculate encrypted data size
+    size_t header_size = 4 + ct_size + 16; // ct_len + ciphertext + iv
+    size_t footer_size = 4 + sig_size;      // sig_len + signature
+    size_t encrypted_data_size = file_size - header_size - footer_size;
+    
+    cout << "  Kyber ciphertext: " << ct_size << " bytes" << endl;
+    cout << "  Encrypted data: " << encrypted_data_size << " bytes" << endl;
+    cout << "  Signature: " << sig_size << " bytes" << endl;
+    
+    // Step 5: Verify signature BEFORE decryption
+    cout << "  Verifying Dilithium signature..." << endl;
+    
+    // Read the data that was signed (everything before signature length field)
+    size_t signed_data_size = file_size - footer_size;
+    input.seekg(0, ios::beg);
+    vector<uint8_t> signed_data(signed_data_size);
+    input.read(reinterpret_cast<char*>(signed_data.data()), signed_data_size);
+    
+    // Read the signature
+    input.seekg(file_size - sig_size, ios::beg);
+    vector<uint8_t> signature(sig_size);
+    input.read(reinterpret_cast<char*>(signature.data()), sig_size);
+    
+    // Verify signature
+    if (!dilithium.verify_signature(signed_data, signature)) {
+        input.close();
+        throw runtime_error("FILE TAMPERED! Signature verification failed. "
+                           "The encrypted file has been modified or corrupted.");
+    }
+    cout << "  Signature verified successfully!" << endl;
+    
+    // Step 6: Get secret key and decapsulate
     vector<uint8_t> secret_key = quantum.get_secret_key();
     if (secret_key.empty()) {
         throw runtime_error("No secret key available. Load keys first.");
     }
     
-    // Step 7: Decapsulate to recover shared secret
-    cout << "  Recovering shared secret..." << endl;
+    cout << "  Recovering shared secret via Kyber decapsulation..." << endl;
     vector<uint8_t> shared_secret = quantum.decapsulate(ciphertext, secret_key);
     
-    // Step 8: Derive AES-256 key from shared secret using SHA-256 KDF
+    // Step 7: Derive AES-256 key from shared secret using SHA-256 KDF
     cout << "  Deriving AES key with SHA-256..." << endl;
     vector<uint8_t> aes_key(32);
     SHA256(shared_secret.data(), shared_secret.size(), aes_key.data());
     
-    // Step 9: Decrypt the data with AES-256-CBC
-    cout << "  Decrypting with AES-256-CBC..." << endl;
-    vector<uint8_t> plaintext = AES::decrypt(encrypted_data, aes_key, iv);
+    // Step 8: Open output file
+    ofstream output(output_path, ios::binary);
+    if (!output) {
+        throw runtime_error("Failed to open output file: " + output_path);
+    }
     
-    // Step 10: Write the decrypted file
-    cout << "  Writing decrypted file: " << output_path << endl;
-    write_file(output_path, plaintext);
+    // Step 9: Seek to encrypted data position and stream decrypt
+    input.seekg(header_size, ios::beg);
+    stream_decrypt(input, output, aes_key, iv, encrypted_data_size);
     
-    cout << "  Decrypted file size: " << plaintext.size() << " bytes" << endl;
-    cout << "\n[SUCCESS] File decrypted successfully!" << endl;
+    input.close();
+    output.close();
+    
+    // Get final file size
+    ifstream final_check(output_path, ios::binary | ios::ate);
+    size_t final_size = final_check.tellg();
+    final_check.close();
+    
+    cout << "  Decrypted file: " << output_path << " (" << final_size << " bytes)" << endl;
+    cout << "\n[SUCCESS] File decrypted and verified successfully!" << endl;
 }

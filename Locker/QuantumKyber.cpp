@@ -4,6 +4,10 @@
 
 using namespace std;
 
+// ============================================================================
+// QuantumWrapper Implementation (Kyber KEM)
+// ============================================================================
+
 // Constructor: Initialize the KEM with the specified algorithm
 QuantumWrapper::QuantumWrapper(const char* alg_name) {
     // Initialize liboqs
@@ -169,4 +173,202 @@ bool QuantumWrapper::load_keys(const string& filename_prefix) {
     
     cout << "Keys loaded from " << pub_filename << " and " << priv_filename << endl;
     return true;
+}
+
+// ============================================================================
+// DilithiumWrapper Implementation (ML-DSA Digital Signatures)
+// ============================================================================
+
+// Constructor: Initialize the signature scheme
+DilithiumWrapper::DilithiumWrapper(const char* alg_name) {
+    // Initialize liboqs (safe to call multiple times)
+    OQS_init();
+    
+    // Check if the algorithm is enabled
+    if (!OQS_SIG_alg_is_enabled(alg_name)) {
+        throw runtime_error(string("Signature algorithm ") + alg_name + " is not enabled");
+    }
+    
+    // Create the signature object
+    sig = OQS_SIG_new(alg_name);
+    if (sig == nullptr) {
+        throw runtime_error(string("Failed to create signature scheme for algorithm ") + alg_name);
+    }
+    
+    cout << "DilithiumWrapper initialized with algorithm: " << alg_name << endl;
+}
+
+// Destructor: Clean up resources
+DilithiumWrapper::~DilithiumWrapper() {
+    if (sig != nullptr) {
+        OQS_SIG_free(sig);
+        sig = nullptr;
+    }
+}
+
+// Generate a signature keypair
+pair<vector<uint8_t>, vector<uint8_t>> DilithiumWrapper::generate_signature_keypair() {
+    if (sig == nullptr) {
+        throw runtime_error("Signature scheme is not initialized");
+    }
+    
+    // Allocate memory for public and secret keys
+    vector<uint8_t> public_key(sig->length_public_key);
+    vector<uint8_t> secret_key(sig->length_secret_key);
+    
+    // Generate the keypair
+    OQS_STATUS status = OQS_SIG_keypair(sig, public_key.data(), secret_key.data());
+    
+    if (status != OQS_SUCCESS) {
+        throw runtime_error("Failed to generate signature keypair");
+    }
+    
+    // Store keys internally
+    stored_public_key = public_key;
+    stored_secret_key = secret_key;
+    
+    cout << "  Generated Dilithium keypair (public: " << public_key.size() 
+         << " bytes, secret: " << secret_key.size() << " bytes)" << endl;
+    
+    return make_pair(public_key, secret_key);
+}
+
+// Sign a message using the stored secret key
+vector<uint8_t> DilithiumWrapper::sign_message(const vector<uint8_t>& message) {
+    if (stored_secret_key.empty()) {
+        throw runtime_error("No secret key available. Generate or load keys first.");
+    }
+    return sign_message(message, stored_secret_key);
+}
+
+// Sign a message using a provided secret key
+vector<uint8_t> DilithiumWrapper::sign_message(const vector<uint8_t>& message, 
+                                                const vector<uint8_t>& secret_key) {
+    if (sig == nullptr) {
+        throw runtime_error("Signature scheme is not initialized");
+    }
+    
+    // Allocate buffer for signature (maximum possible size)
+    vector<uint8_t> signature(sig->length_signature);
+    size_t signature_len = 0;
+    
+    // Sign the message
+    OQS_STATUS status = OQS_SIG_sign(sig, signature.data(), &signature_len,
+                                      message.data(), message.size(),
+                                      secret_key.data());
+    
+    if (status != OQS_SUCCESS) {
+        throw runtime_error("Failed to sign message");
+    }
+    
+    // Resize to actual signature length
+    signature.resize(signature_len);
+    return signature;
+}
+
+// Verify a signature using the stored public key
+bool DilithiumWrapper::verify_signature(const vector<uint8_t>& message, 
+                                         const vector<uint8_t>& signature) {
+    if (stored_public_key.empty()) {
+        throw runtime_error("No public key available. Generate or load keys first.");
+    }
+    return verify_signature(message, signature, stored_public_key);
+}
+
+// Verify a signature using a provided public key
+bool DilithiumWrapper::verify_signature(const vector<uint8_t>& message, 
+                                         const vector<uint8_t>& signature,
+                                         const vector<uint8_t>& public_key) {
+    if (sig == nullptr) {
+        throw runtime_error("Signature scheme is not initialized");
+    }
+    
+    // Verify the signature
+    OQS_STATUS status = OQS_SIG_verify(sig, message.data(), message.size(),
+                                        signature.data(), signature.size(),
+                                        public_key.data());
+    
+    return (status == OQS_SUCCESS);
+}
+
+// Save signature keys to files
+bool DilithiumWrapper::save_keys(const string& filename_prefix) {
+    if (stored_public_key.empty() || stored_secret_key.empty()) {
+        cerr << "No signature keys to save. Generate keys first." << endl;
+        return false;
+    }
+    
+    // Save public key
+    string pub_filename = filename_prefix + ".sig.pub";
+    ofstream pub_file(pub_filename, ios::binary);
+    if (!pub_file) {
+        cerr << "Failed to open " << pub_filename << " for writing" << endl;
+        return false;
+    }
+    pub_file.write(reinterpret_cast<const char*>(stored_public_key.data()), stored_public_key.size());
+    pub_file.close();
+    
+    // Save secret key
+    string priv_filename = filename_prefix + ".sig.priv";
+    ofstream priv_file(priv_filename, ios::binary);
+    if (!priv_file) {
+        cerr << "Failed to open " << priv_filename << " for writing" << endl;
+        return false;
+    }
+    priv_file.write(reinterpret_cast<const char*>(stored_secret_key.data()), stored_secret_key.size());
+    priv_file.close();
+    
+    cout << "Signature keys saved to " << pub_filename << " and " << priv_filename << endl;
+    return true;
+}
+
+// Load signature keys from files
+bool DilithiumWrapper::load_keys(const string& filename_prefix) {
+    if (sig == nullptr) {
+        cerr << "Signature scheme is not initialized" << endl;
+        return false;
+    }
+    
+    // Load public key
+    string pub_filename = filename_prefix + ".sig.pub";
+    ifstream pub_file(pub_filename, ios::binary);
+    if (!pub_file) {
+        cerr << "Failed to open " << pub_filename << " for reading" << endl;
+        return false;
+    }
+    
+    pub_file.seekg(0, ios::end);
+    size_t pub_size = pub_file.tellg();
+    pub_file.seekg(0, ios::beg);
+    
+    stored_public_key.resize(pub_size);
+    pub_file.read(reinterpret_cast<char*>(stored_public_key.data()), pub_size);
+    pub_file.close();
+    
+    // Load secret key
+    string priv_filename = filename_prefix + ".sig.priv";
+    ifstream priv_file(priv_filename, ios::binary);
+    if (!priv_file) {
+        cerr << "Failed to open " << priv_filename << " for reading" << endl;
+        return false;
+    }
+    
+    priv_file.seekg(0, ios::end);
+    size_t priv_size = priv_file.tellg();
+    priv_file.seekg(0, ios::beg);
+    
+    stored_secret_key.resize(priv_size);
+    priv_file.read(reinterpret_cast<char*>(stored_secret_key.data()), priv_size);
+    priv_file.close();
+    
+    cout << "Signature keys loaded from " << pub_filename << " and " << priv_filename << endl;
+    return true;
+}
+
+// Get maximum signature length
+size_t DilithiumWrapper::get_signature_length() const {
+    if (sig == nullptr) {
+        throw runtime_error("Signature scheme is not initialized");
+    }
+    return sig->length_signature;
 }
