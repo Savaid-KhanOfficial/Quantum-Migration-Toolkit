@@ -18,11 +18,12 @@ vector<uint8_t> FileEncryptor::generate_iv() {
     return iv;
 }
 
-// Stream encrypt file content in 64MB chunks
+// Stream encrypt file content in 64MB chunks with SHA256 hashing for signature
 void FileEncryptor::stream_encrypt(ifstream& input, ofstream& output,
                                     const vector<uint8_t>& key,
                                     const vector<uint8_t>& iv,
-                                    size_t input_size) {
+                                    size_t input_size,
+                                    SHA256_CTX& hash_ctx) {
     // Create and initialize the cipher context
     EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
     if (!ctx) {
@@ -63,6 +64,9 @@ void FileEncryptor::stream_encrypt(ifstream& input, ofstream& output,
             throw runtime_error("EVP_EncryptUpdate failed");
         }
         
+        // Update hash with encrypted chunk BEFORE writing to disk
+        SHA256_Update(&hash_ctx, output_buffer.data(), out_len);
+        
         // Write encrypted chunk to output
         output.write(reinterpret_cast<char*>(output_buffer.data()), out_len);
         
@@ -84,6 +88,8 @@ void FileEncryptor::stream_encrypt(ifstream& input, ofstream& output,
     }
     
     if (out_len > 0) {
+        // Update hash with final padding block
+        SHA256_Update(&hash_ctx, output_buffer.data(), out_len);
         output.write(reinterpret_cast<char*>(output_buffer.data()), out_len);
     }
     
@@ -94,11 +100,12 @@ void FileEncryptor::stream_encrypt(ifstream& input, ofstream& output,
     EVP_CIPHER_CTX_free(ctx);
 }
 
-// Stream decrypt file content in 64MB chunks
+// Stream decrypt file content in 64MB chunks with SHA256 hashing for verification
 void FileEncryptor::stream_decrypt(ifstream& input, ofstream& output,
                                     const vector<uint8_t>& key,
                                     const vector<uint8_t>& iv,
-                                    size_t encrypted_size) {
+                                    size_t encrypted_size,
+                                    SHA256_CTX& hash_ctx) {
     // Create and initialize the cipher context
     EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
     if (!ctx) {
@@ -131,6 +138,9 @@ void FileEncryptor::stream_decrypt(ifstream& input, ofstream& output,
         }
         
         size_t bytes_read = input.gcount();
+        
+        // Update hash with encrypted chunk (input buffer) as we read it
+        SHA256_Update(&hash_ctx, input_buffer.data(), bytes_read);
         
         // Decrypt this chunk
         if (EVP_DecryptUpdate(ctx, output_buffer.data(), &out_len,
@@ -174,7 +184,7 @@ void FileEncryptor::encrypt_file(QuantumWrapper& quantum,
                                   DilithiumWrapper& dilithium,
                                   const string& input_path, 
                                   const string& output_path) {
-    cout << "\n[FILE ENCRYPTOR v2] Starting quantum-safe encryption with streaming..." << endl;
+    cout << "\n[FILE ENCRYPTOR v2.1] Starting quantum-safe encryption with streaming hash-then-sign..." << endl;
     
     // Step 1: Get public key from the quantum wrapper
     vector<uint8_t> public_key = quantum.get_public_key();
@@ -211,46 +221,43 @@ void FileEncryptor::encrypt_file(QuantumWrapper& quantum,
         throw runtime_error("Failed to open output file: " + output_path);
     }
     
-    // Step 7: Write header - Kyber ciphertext (no public key!)
+    // Step 7: Initialize SHA256 context for streaming hash
+    SHA256_CTX hash_ctx;
+    SHA256_Init(&hash_ctx);
+    
+    // Step 8: Write header - Kyber ciphertext (no public key!)
     // File format: [ct_len(4B)][ciphertext][iv(16B)][encrypted_data][sig_len(4B)][signature]
     uint32_t ct_size = static_cast<uint32_t>(ciphertext.size());
     output.write(reinterpret_cast<const char*>(&ct_size), 4);
     output.write(reinterpret_cast<const char*>(ciphertext.data()), ciphertext.size());
     
+    // Update hash with header (ciphertext length + ciphertext)
+    SHA256_Update(&hash_ctx, reinterpret_cast<const uint8_t*>(&ct_size), 4);
+    SHA256_Update(&hash_ctx, ciphertext.data(), ciphertext.size());
+    
     // Write IV (fixed 16 bytes)
     output.write(reinterpret_cast<const char*>(iv.data()), iv.size());
     
-    // Record position where encrypted data starts (for signature calculation)
-    streampos encrypted_data_start = output.tellp();
+    // Update hash with IV
+    SHA256_Update(&hash_ctx, iv.data(), iv.size());
     
-    // Step 8: Stream encrypt the file content
-    stream_encrypt(input, output, aes_key, iv, input_size);
+    // Step 9: Stream encrypt the file content (also updates hash_ctx)
+    stream_encrypt(input, output, aes_key, iv, input_size, hash_ctx);
     
     input.close();
-    
-    // Step 9: Calculate signature over the entire ciphertext portion
-    // (Kyber ciphertext + IV + encrypted data)
     output.flush();
-    streampos encrypted_data_end = output.tellp();
     
-    // Read back the data we need to sign
-    cout << "  Generating Dilithium signature..." << endl;
+    // Step 10: Finalize hash to get 32-byte digest
+    vector<uint8_t> file_hash(SHA256_DIGEST_LENGTH);
+    SHA256_Final(file_hash.data(), &hash_ctx);
     
-    ifstream sign_input(output_path, ios::binary);
-    if (!sign_input) {
-        throw runtime_error("Failed to reopen output file for signing");
-    }
+    cout << "  Generating Dilithium signature over file hash..." << endl;
     
-    size_t data_to_sign_size = static_cast<size_t>(encrypted_data_end);
-    vector<uint8_t> data_to_sign(data_to_sign_size);
-    sign_input.read(reinterpret_cast<char*>(data_to_sign.data()), data_to_sign_size);
-    sign_input.close();
+    // Step 11: Sign ONLY the 32-byte hash (not the entire file!)
+    vector<uint8_t> signature = dilithium.sign_message(file_hash);
+    cout << "  Signature size: " << signature.size() << " bytes (signing 32-byte hash)" << endl;
     
-    // Sign the ciphertext
-    vector<uint8_t> signature = dilithium.sign_message(data_to_sign);
-    cout << "  Signature size: " << signature.size() << " bytes" << endl;
-    
-    // Step 10: Append signature to output file
+    // Step 12: Append signature to output file
     uint32_t sig_size = static_cast<uint32_t>(signature.size());
     output.write(reinterpret_cast<const char*>(&sig_size), 4);
     output.write(reinterpret_cast<const char*>(signature.data()), signature.size());
@@ -270,7 +277,7 @@ void FileEncryptor::decrypt_file(QuantumWrapper& quantum,
                                   DilithiumWrapper& dilithium,
                                   const string& input_path, 
                                   const string& output_path) {
-    cout << "\n[FILE DECRYPTOR v2] Starting quantum-safe decryption with verification..." << endl;
+    cout << "\n[FILE DECRYPTOR v2.1] Starting quantum-safe decryption with streaming verification..." << endl;
     
     // Step 1: Open encrypted file and get size
     ifstream input(input_path, ios::binary);
@@ -283,20 +290,26 @@ void FileEncryptor::decrypt_file(QuantumWrapper& quantum,
     input.seekg(0, ios::beg);
     cout << "  Encrypted file: " << input_path << " (" << file_size << " bytes)" << endl;
     
-    // Step 2: Read Kyber ciphertext
+    // Step 2: Initialize SHA256 context for streaming hash verification
+    SHA256_CTX hash_ctx;
+    SHA256_Init(&hash_ctx);
+    
+    // Step 3: Read Kyber ciphertext and update hash
     uint32_t ct_size;
     input.read(reinterpret_cast<char*>(&ct_size), 4);
+    SHA256_Update(&hash_ctx, reinterpret_cast<const uint8_t*>(&ct_size), 4);
     
     vector<uint8_t> ciphertext(ct_size);
     input.read(reinterpret_cast<char*>(ciphertext.data()), ct_size);
+    SHA256_Update(&hash_ctx, ciphertext.data(), ct_size);
     
-    // Step 3: Read IV
+    // Step 4: Read IV and update hash
     vector<uint8_t> iv(16);
     input.read(reinterpret_cast<char*>(iv.data()), 16);
+    SHA256_Update(&hash_ctx, iv.data(), 16);
     
-    // Step 4: Calculate where encrypted data ends and signature begins
+    // Step 5: Calculate where encrypted data ends and signature begins
     // File structure: [ct_len(4B)][ciphertext][iv(16B)][encrypted_data][sig_len(4B)][signature]
-    // We need to read signature length from the end to determine encrypted data size
     
     streampos current_pos = input.tellg(); // Position after IV
     
@@ -314,29 +327,12 @@ void FileEncryptor::decrypt_file(QuantumWrapper& quantum,
     cout << "  Encrypted data: " << encrypted_data_size << " bytes" << endl;
     cout << "  Signature: " << sig_size << " bytes" << endl;
     
-    // Step 5: Verify signature BEFORE decryption
-    cout << "  Verifying Dilithium signature..." << endl;
-    
-    // Read the data that was signed (everything before signature length field)
-    size_t signed_data_size = file_size - footer_size;
-    input.seekg(0, ios::beg);
-    vector<uint8_t> signed_data(signed_data_size);
-    input.read(reinterpret_cast<char*>(signed_data.data()), signed_data_size);
-    
-    // Read the signature
+    // Step 6: Read the signature for later verification
     input.seekg(file_size - sig_size, ios::beg);
     vector<uint8_t> signature(sig_size);
     input.read(reinterpret_cast<char*>(signature.data()), sig_size);
     
-    // Verify signature
-    if (!dilithium.verify_signature(signed_data, signature)) {
-        input.close();
-        throw runtime_error("FILE TAMPERED! Signature verification failed. "
-                           "The encrypted file has been modified or corrupted.");
-    }
-    cout << "  Signature verified successfully!" << endl;
-    
-    // Step 6: Get secret key and decapsulate
+    // Step 7: Get secret key and decapsulate
     vector<uint8_t> secret_key = quantum.get_secret_key();
     if (secret_key.empty()) {
         throw runtime_error("No secret key available. Load keys first.");
@@ -345,23 +341,40 @@ void FileEncryptor::decrypt_file(QuantumWrapper& quantum,
     cout << "  Recovering shared secret via Kyber decapsulation..." << endl;
     vector<uint8_t> shared_secret = quantum.decapsulate(ciphertext, secret_key);
     
-    // Step 7: Derive AES-256 key from shared secret using SHA-256 KDF
+    // Step 8: Derive AES-256 key from shared secret using SHA-256 KDF
     cout << "  Deriving AES key with SHA-256..." << endl;
     vector<uint8_t> aes_key(32);
     SHA256(shared_secret.data(), shared_secret.size(), aes_key.data());
     
-    // Step 8: Open output file
+    // Step 9: Open output file
     ofstream output(output_path, ios::binary);
     if (!output) {
         throw runtime_error("Failed to open output file: " + output_path);
     }
     
-    // Step 9: Seek to encrypted data position and stream decrypt
+    // Step 10: Seek to encrypted data position and stream decrypt
+    // (stream_decrypt will also update hash_ctx with encrypted chunks)
     input.seekg(header_size, ios::beg);
-    stream_decrypt(input, output, aes_key, iv, encrypted_data_size);
+    stream_decrypt(input, output, aes_key, iv, encrypted_data_size, hash_ctx);
     
     input.close();
     output.close();
+    
+    // Step 11: Finalize hash to get 32-byte digest
+    vector<uint8_t> computed_hash(SHA256_DIGEST_LENGTH);
+    SHA256_Final(computed_hash.data(), &hash_ctx);
+    
+    // Step 12: Verify the signature against the computed hash
+    cout << "  Verifying Dilithium signature over computed hash..." << endl;
+    
+    if (!dilithium.verify_signature(computed_hash, signature)) {
+        // CRITICAL: Delete the potentially corrupted/tampered output file
+        remove(output_path.c_str());
+        throw runtime_error("TAMPERING DETECTED! Signature verification failed. "
+                           "The encrypted file has been modified or corrupted. "
+                           "Output file has been deleted for security.");
+    }
+    cout << "  Signature verified successfully!" << endl;
     
     // Get final file size
     ifstream final_check(output_path, ios::binary | ios::ate);

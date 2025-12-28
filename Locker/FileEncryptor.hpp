@@ -7,29 +7,34 @@
 #include <vector>
 #include <cstdint>
 #include <fstream>
+#include <openssl/sha.h>
 
 using namespace std;
 
 // Chunk size for streaming encryption/decryption (64 MB)
 constexpr size_t CHUNK_SIZE = 64 * 1024 * 1024;
 
-// File format (.qenc v2):
+// File format (.qenc v2.1):
 // [ciphertext_len (4B)] [ciphertext (Kyber KEM)]
 // [iv (16B)]
 // [encrypted_data (streamed AES-256-CBC)]
-// [signature_len (4B)] [signature (Dilithium)]
+// [signature_len (4B)] [signature (Dilithium over SHA256 hash)]
+//
+// NOTE: Signature is computed over SHA256(header + encrypted_data),
+//       NOT the raw file data. This allows O(1) memory signing/verification.
 
 class FileEncryptor {
 public:
     // Encrypt a file using Quantum-safe key exchange + AES-256 (streaming)
-    // Signs the ciphertext with Dilithium for integrity verification
+    // Signs the SHA256 hash of ciphertext with Dilithium for integrity
     static void encrypt_file(QuantumWrapper& quantum, 
                              DilithiumWrapper& dilithium,
                              const string& input_path, 
                              const string& output_path);
     
     // Decrypt a file using Quantum-safe key exchange + AES-256 (streaming)
-    // Verifies Dilithium signature before decryption
+    // Verifies Dilithium signature AFTER computing streaming hash
+    // Deletes output file if verification fails (tampering detected)
     static void decrypt_file(QuantumWrapper& quantum, 
                              DilithiumWrapper& dilithium,
                              const string& input_path, 
@@ -39,17 +44,19 @@ private:
     // Generate random IV for AES (using OpenSSL CSPRNG)
     static vector<uint8_t> generate_iv();
     
-    // Stream encrypt file content in chunks
+    // Stream encrypt file content in chunks with SHA256 hashing
     static void stream_encrypt(ifstream& input, ofstream& output,
                                const vector<uint8_t>& key, 
                                const vector<uint8_t>& iv,
-                               size_t input_size);
+                               size_t input_size,
+                               SHA256_CTX& hash_ctx);
     
-    // Stream decrypt file content in chunks
+    // Stream decrypt file content in chunks with SHA256 hashing
     static void stream_decrypt(ifstream& input, ofstream& output,
                                const vector<uint8_t>& key,
                                const vector<uint8_t>& iv,
-                               size_t encrypted_size);
+                               size_t encrypted_size,
+                               SHA256_CTX& hash_ctx);
 };
 
 #endif // FILE_ENCRYPTOR_HPP
